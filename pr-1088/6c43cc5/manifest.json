@@ -1,0 +1,29 @@
+{
+  "summary": "PR 在 Agent 页加入 OpenClaw：未安装时在「安装其他 Agent」中列出官方安装命令；接入后在展开的 Agent 详情里提供主模型与有序降级模型的模型链编辑器，并补上官方彩色图标与中、英、繁中、日、德文案。",
+  "scenes": [
+    {
+      "title": "安装入口中的 OpenClaw",
+      "shots": [
+        {
+          "file": "01-agents-install-folded.png",
+          "caption": "Agent 页下方的「安装其他 Agent」",
+          "width": 2168
+        },
+        {
+          "file": "02-openclaw-install-entry.png",
+          "caption": "展开后的安装列表",
+          "width": 2168
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒没有安装或接入 OpenClaw（也没有它的配置文件），所以展开行内的「配置模型」模型链编辑器——主模型、降级模型、上移、删除、添加降级模型、自动保存和保存失败提示——不会出现；它只在 OpenClaw 被检测到并在 Agent 页展开其行时渲染。",
+  "interactive": true,
+  "pages": 1
+}
