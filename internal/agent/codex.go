@@ -543,6 +543,11 @@ func codexIn(at place) *Agent {
 	// Codex's background compaction, as Settings has it (#2490): written
 	// where Codex is routed through magpie, taken back where it isn't
 	asyncCompaction := func(routed bool) error {
+		// a compact limit tune wrote here before goes to Long
+		// conversations, the one window magpie keeps (7eleven)
+		if at.id == "" && at.spell == nil {
+			tuneMigrateCodex(at.home)
+		}
 		s := settings.Load()
 		on := s.CodexAsyncCompact && routed
 		return codexAsyncSync(path, at.key("codex.async"), routed, s.CodexAsyncCompact, s.CodexAsyncCompactPercent, on && codexAsyncTableOK(at))
@@ -1163,7 +1168,7 @@ func codexIn(at place) *Agent {
 		if !through && (!onSignIn || codexFailover()) {
 			return append(own, viaMagpie("codex", "")...)
 		}
-		return append(own, viaMagpieFor("codex", "")...)
+		return append(own, codexViaMagpieFor(own)...)
 	}
 	// unroute takes magpie out as the way Codex reaches its models and puts
 	// back what the stash kept from before magpie was wired in (its
@@ -1336,6 +1341,24 @@ func codexIn(at place) *Agent {
 		// joined, a model of Codex's own is picked beside magpie's, as in
 		// Codex's /model: it stays connected
 		if joined() && !api() && chatGPT() {
+			// magpie made its provider for a used-up account (codex.out)
+			// and that no longer holds (kept on ChatGPT, or room again):
+			// back on the sign-in as Join leaves it. Only the model set
+			// left magpie the provider of one of Codex's own for good
+			// (eddie.zhan on Discord, Always ChatGPT from the takeover)
+			if asProvider() && stashLoad()[at.key("codex.out")] == "1" && !out() {
+				forget(at.key("codex.out"), at.key("codex.out_own"))
+				if err := edit.DelTOMLTop(path, "model_provider", "model_catalog_json"); err != nil {
+					return err
+				}
+				if err := edit.SetTOMLTop(path,
+					edit.KV{Path: "openai_base_url", Value: at.codexURL()},
+					edit.KV{Path: "model", Value: v},
+				); err != nil {
+					return err
+				}
+				return settle()
+			}
 			if err := edit.SetTOMLTop(path, edit.KV{Path: "model", Value: v}); err != nil {
 				return err
 			}
@@ -2010,7 +2033,7 @@ func ownCodex() []catalog.Model {
 
 // codexInMagpie marks Served those of Codex's own models that magpie's list
 // shows Codex on a ChatGPT account of the user's (codex/gpt-5.5): its
-// pickers leave out magpie's codex/… as only a hop (viaMagpieFor), so these
+// pickers leave out magpie's codex/… as only a hop (codexViaMagpieFor), so these
 // are how they are offered, and the agent's own models switched off
 // (provider.OwnModelsHidden) never takes them out. It did once a routing
 // group gave the picker a catalog entry, and Codex's picker was the group
@@ -2027,6 +2050,34 @@ func codexInMagpie(own []Option) []Option {
 		own[i].Served = on[own[i].Value]
 	}
 	return own
+}
+
+// codexViaMagpieFor is viaMagpieFor("codex") keeping the models magpie
+// serves on a ChatGPT account that own, Codex's own list, leaves out: one
+// Codex hides from its picker (gpt-6.1-terra) but the user ticked on the
+// subscription was offered nowhere (ysm119 on Discord), as the hop is all
+// that reaches it. Those come first, in own's group: a "Codex" section
+// of their own beside it read as a second kind of model (ysm119).
+func codexViaMagpieFor(own []Option) []Option {
+	in := map[string]bool{}
+	for _, o := range own {
+		in[o.Value] = true
+		if m := codexOwnOf(o.Value); m != "" {
+			in[m] = true
+		}
+	}
+	var hidden, out []Option
+	for _, o := range viaMagpie("codex", "") {
+		if !strings.HasPrefix(o.Value, "codex/") {
+			out = append(out, o)
+		} else if !in[codexOwnOf(o.Value)] {
+			if len(own) > 0 {
+				o.Group, o.GroupIcon = own[0].Group, own[0].GroupIcon
+			}
+			hidden = append(hidden, o)
+		}
+	}
+	return append(hidden, out...)
 }
 
 // codexOwnViaMagpie is the catalog id magpie serves one of Codex's own
@@ -2247,8 +2298,8 @@ func CodexSideModel() string {
 }
 
 // CodexSideSet says whether this machine's Codex config names the model
-// for a side call itself: "subagent" for [agents] default_subagent_model,
-// "memories" for [memories] extract_model or consolidation_model. A config
+// for a side call itself: "memories" for [memories] extract_model or
+// consolidation_model. A config
 // that can't be read counts as set, so the gateway leaves the call as Codex
 // sent it (gateway.CodexSideSet).
 func CodexSideSet(which string) bool {
@@ -2258,9 +2309,6 @@ func CodexSideSet(which string) bool {
 	}
 	path := filepath.Join(here(home).codexHome(), "config.toml")
 	switch which {
-	case "subagent":
-		t, err := edit.GetTOMLTable(path, "agents")
-		return err != nil || t["default_subagent_model"] != ""
 	case "memories":
 		t, err := edit.GetTOMLTable(path, "memories")
 		return err != nil || t["extract_model"] != "" || t["consolidation_model"] != ""

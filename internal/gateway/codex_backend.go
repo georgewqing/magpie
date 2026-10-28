@@ -130,18 +130,15 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 			// a subagent on one of Codex's own models, put on the model
 			// set for Codex's subagents, a ChatGPT account's in magpie;
 			// the request on the model asked for when it can't be, the
-			// trace saying why (codexUpstreamOn, serve). One with nothing
-			// set for it, a subagent's or a memory call,
-			// on the model its conversation is on when that is one of
-			// magpie's, not on the ChatGPT sign-in (codexFollowTo)
+			// trace saying why (codexUpstreamOn, serve). With none set,
+			// it stays on the model it was named (codexFollowTo). A
+			// memory call with nothing set for it goes on the model its
+			// conversation is on when that is one of magpie's, not on
+			// the ChatGPT sign-in (codexFollowTo)
 			if !strings.Contains(model, "/") {
 				pick := codexSubagentPick(r, agentOf(r), kind, model, body)
-				if to := s.codexFollowTo(r, agentOf(r), kind, model, body); to != "" && pick == nil {
-					if usage.PurposeOf(kind) == "kind:collab_spawn" {
-						pick = &SubagentPick{Asked: model, To: to}
-					} else {
-						body, model = withModel(body, to), to
-					}
+				if to := s.codexFollowTo(r, agentOf(r), kind, model, body); to != "" {
+					body, model = withModel(body, to), to
 				}
 				r = withSubagentPick(r, pick)
 				if pick.Moved() {
@@ -442,7 +439,9 @@ func loggedAnswers(convs ...string) []loggedAnswer {
 	// from itself)
 	renamed := provider.UsageRenames()
 	usage.Visit(time.Now().Add(-sealerKeep), func(r usage.Record) {
-		r.Provider = renamed.Of(r.Provider, r.Time)
+		// the provider that answered, not one a deleted provider's
+		// calls were merged into on the Usage page (Renames.Own)
+		r.Provider = renamed.Own(r.Provider, r.Time)
 		if r.Provider == "" || r.Provider == "magpie" || r.IsRejected() || r.IsReported() || r.Status <= 0 || r.Status >= 400 || r.Computer != "" || isTitleKind(r.Kind) {
 			return
 		}
@@ -976,7 +975,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		if m := noteMasked(r, "chat", maskedHits, string(body), tr.ID, "openai", model); m != nil {
 			s.trace.update(tr, func(t *Route) { t.Masked = m })
 		}
-		promptRead := s.inspectPrompt(tr, provider.Responses, body, body)
+		promptRead := s.inspectPrompt(tr, provider.Responses, body, body, false)
 		end = func(status int, msg string, tokens, out int) {
 			ms := time.Since(start).Milliseconds()
 			ttft, text := first.ms()
@@ -1228,7 +1227,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			// models was picked, which goes out with Codex's own sign-in
 			msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			writeError(w, provider.Responses, res.StatusCode, codexKeyRefused(msg))
-			s.record(Call{Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
+			s.record(Call{Route: routeOf(tr), Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
 				Provider: "openai", Agent: callerOf(r).agent, Status: res.StatusCode,
 				Millis: time.Since(start).Milliseconds(), Error: res.Status})
 			end(res.StatusCode, res.Status, 0, 0)
@@ -1251,7 +1250,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				// as its markup: said where the turn, or the compaction
 				// (outrageous_piglet on Discord), went
 				failWith(res.StatusCode, said)
-				s.record(Call{Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
+				s.record(Call{Route: routeOf(tr), Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
 					Provider: "openai", Agent: callerOf(r).agent, Kind: callKind(r.Header), Status: res.StatusCode,
 					Millis: time.Since(start).Milliseconds(), Error: said})
 				end(res.StatusCode, said, 0, 0)
@@ -1416,7 +1415,7 @@ func (s *Server) codexFallsBack(model string, body []byte) bool {
 		return false
 	}
 	for _, id := range p.Fallback {
-		if _, _, ok := provider.Resolve(id); ok {
+		if _, _, ok := provider.ResolveRoute(id); ok {
 			return true
 		}
 	}
@@ -1630,6 +1629,16 @@ func codexSaidNothing(rest, model, who string, res *http.Response, msg []byte) (
 	return who + " answered " + what + " for " + model + " " + res.Status + said +
 		". " + model + " is one of Codex's own models, which goes to OpenAI, not to a provider in magpie; try again later, " +
 		"or pick one of magpie's models in Codex (provider/model, or set it in magpie's Agents view)", true
+}
+
+// routeOf is the id of the route a Codex relay opened, so the call it
+// records is the one the Routing page's "Request and response" opens (#2481);
+// 0 for a compaction, which opens none.
+func routeOf(tr *Route) int64 {
+	if tr == nil {
+		return 0
+	}
+	return tr.ID
 }
 
 // apiKey reports whether Codex signed in with an API key rather than a
@@ -1969,22 +1978,6 @@ func codexMerged(own []any, cached bool) []any {
 		for _, m := range own {
 			o, _ := m.(map[string]any)
 			if slug, _ := o["slug"].(string); off[slug] {
-				continue
-			}
-			kept = append(kept, m)
-		}
-		own = kept
-	}
-	// and the ones kept for routing groups, every one when the codex
-	// provider serves only through them (#1602): a hidden one stays, as it
-	// does through the picks. A Codex here for account failover alone is
-	// handed no groups, so it keeps its own.
-	if all, off := provider.CodexNativeUnlisted(); (all || len(off) > 0) && !codexOwnOnly() {
-		kept := own[:0]
-		for _, m := range own {
-			o, _ := m.(map[string]any)
-			slug, _ := o["slug"].(string)
-			if v, _ := o["visibility"].(string); v != "hide" && (all || off[slug]) {
 				continue
 			}
 			kept = append(kept, m)
@@ -2692,17 +2685,36 @@ func boundCallIDs(body []byte) []byte {
 // openaiOnly are the parts of a Responses request Codex sends only to a
 // provider named "OpenAI": its built-in one (signed in, through
 // openai_base_url), or CC Switch's table so named for remote compaction.
-// Under any other name Codex leaves them out itself (client.rs, !is_openai).
+// Under any other name Codex leaves them out itself (client.rs, !is_openai):
+// output token replay's include and the sealed output it carries back on a
+// message or call (encrypted_content on any item but reasoning and a
+// compaction).
 var openaiOnly = [][]byte{[]byte(`"internal_chat_message_metadata_passthrough"`),
-	[]byte(`"encrypted_function_args"`), []byte(`"stream_options"`), []byte(`"configuration_update"`)}
+	[]byte(`"encrypted_function_args"`), []byte(`"stream_options"`), []byte(`"configuration_update"`),
+	[]byte(`"` + outputReplay + `"`), []byte(`"encrypted_content"`)}
+
+// outputReplay is what Codex asks OpenAI for with output token replay on
+// (client.rs): each message's and call's own sealed copy. Copilot's
+// /responses refuses it ("Invalid value: 'output.encrypted_content'",
+// echo_ts), as an API that isn't OpenAI's may.
+const outputReplay = "output.encrypted_content"
+
+// keepsSeal are the input items whose encrypted_content Codex sends any
+// provider (ResponseItem::clear_encrypted_content leaves only these): a
+// reasoning item's, which foreignReasoning takes out once refused, and a
+// compaction's.
+var keepsSeal = map[string]bool{`"reasoning"`: true, `"compaction"`: true, `"compaction_summary"`: true, `"context_compaction"`: true}
 
 // forVendor is a Responses request as Codex sends it to a provider not
 // OpenAI's: without its messages' internal metadata, a call's
-// encrypted_function_args, stream_options' reasoning_summary_delivery and
-// configuration_update items.
+// encrypted_function_args, stream_options' reasoning_summary_delivery,
+// configuration_update items, output.encrypted_content in its include,
+// and the sealed output (encrypted_content) on a message or call that an
+// OpenAI model wrote earlier in the conversation.
 // A relay that checks it is Codex's turned the lot away ("invalid codex
-// request", #292). OpenAI's API and the ChatGPT backend get it as it came;
-// so does anything else, byte for byte, when none of them is in it.
+// request", #292), and Copilot the include (echo_ts). OpenAI's API and the
+// ChatGPT backend get it as it came; so does anything else, byte for byte,
+// when none of them is in it.
 func forVendor(p provider.Provider, body []byte) []byte {
 	if p.Account != nil && p.Account.Agent == "codex" || strings.HasSuffix(p.Host(), "openai.com") {
 		return body
@@ -2726,6 +2738,15 @@ func forVendor(p provider.Provider, body []byte) []byte {
 			}
 		}
 	}
+	var include []string
+	if decodeJSON(q["include"], &include) == nil && slices.Contains(include, outputReplay) {
+		changed = true
+		if include = slices.DeleteFunc(include, func(v string) bool { return v == outputReplay }); len(include) == 0 {
+			delete(q, "include")
+		} else {
+			q["include"], _ = marshalPlain(include)
+		}
+	}
 	if items, err := rawArray(q["input"]); err == nil {
 		out := items[:0]
 		for _, raw := range items {
@@ -2740,10 +2761,15 @@ func forVendor(p provider.Provider, body []byte) []byte {
 			}
 			_, meta := it["internal_chat_message_metadata_passthrough"]
 			_, sealed := it["encrypted_function_args"]
-			if meta || sealed {
+			_, replay := it["encrypted_content"]
+			replay = replay && !keepsSeal[string(it["type"])]
+			if meta || sealed || replay {
 				changed = true
 				delete(it, "internal_chat_message_metadata_passthrough")
 				delete(it, "encrypted_function_args")
+				if replay {
+					delete(it, "encrypted_content")
+				}
 				raw, _ = marshalPlain(it)
 			}
 			out = append(out, raw)
@@ -2803,16 +2829,23 @@ func forVendorChanges(body []byte) bool {
 			return true
 		}
 	}
+	if inc, found, ok := topMember(body, "include"); !ok {
+		return false
+	} else if found && bytes.Contains(inc, []byte(`"`+outputReplay+`"`)) {
+		return true
+	}
 	return anyInputItem(body, func(it []byte) bool {
 		if len(it) == 0 || it[0] != '{' {
 			return false
 		}
-		if string(memberOrNil(it, "type")) == `"configuration_update"` {
+		typ := string(memberOrNil(it, "type"))
+		if typ == `"configuration_update"` {
 			return true
 		}
 		_, meta := memberOf(it, "internal_chat_message_metadata_passthrough")
 		_, sealed := memberOf(it, "encrypted_function_args")
-		return meta || sealed
+		_, replay := memberOf(it, "encrypted_content")
+		return meta || sealed || replay && !keepsSeal[typ]
 	})
 }
 
@@ -2923,18 +2956,42 @@ func (s *Server) codexCompact(w http.ResponseWriter, r *http.Request, body []byt
 		writeError(w, provider.Responses, 502, msg)
 		return
 	}
+	if local == "" && strings.TrimSpace(res.summary()) == "" && calledTool(res.Output) {
+		// a model deep in a conversation of tool calls goes on calling
+		// them, offered none or not: DeepSeek through a group answered the
+		// summary request with reasoning and an exec_command call, 3 times
+		// in a row (Lucy on Discord, auto-deepseek-v4-1-flash). Whatever
+		// let it — an upstream that reads calls out of its text with no
+		// tools offered, a history tool declared as a stub that it calls
+		// anyway — the history's calls are what it follows. Asked again
+		// with the conversation as text, there's no exchange of calls to
+		// go on with; when it still writes no summary, magpie compacts
+		// without a model, so Codex goes on rather than failing over and
+		// over
+		who, _ := compactFailure(body, rec)
+		called := answeredWith(res.Output)
+		log.Printf("codex compaction: %s wrote no summary%s; asking again with the conversation as text", who, called)
+		prec, pres, perr := ask(plainCompact(body))
+		switch {
+		case perr == nil && prec.status < 400 && pres.Status != "incomplete" && strings.TrimSpace(pres.summary()) != "":
+			rec, res = prec, pres
+		default:
+			again := "no summary" + answeredWith(pres.Output)
+			if perr != nil {
+				again = perr.Error()
+			} else if prec.status >= 400 {
+				_, msg := compactFailure(body, prec)
+				again = fmt.Sprintf("%d: %s", prec.status, msg)
+			}
+			log.Printf("codex compaction: %s asked again as text: %s; compacting locally", who, again)
+			local = localSummary(body, who+" wrote no summary"+called+", asked again as text: "+again)
+		}
+	}
 	var sum strings.Builder
 	if local != "" {
 		sum.WriteString(local)
 	} else {
-		for _, o := range res.Output {
-			if o.Type != "message" {
-				continue
-			}
-			for _, c := range o.Content {
-				sum.WriteString(c.Text)
-			}
-		}
+		sum.WriteString(res.summary())
 	}
 	if strings.TrimSpace(sum.String()) == "" {
 		why := "the model wrote no summary" + answeredWith(res.Output)
@@ -3169,6 +3226,26 @@ type compactResult struct {
 	Error             *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// summary is the text of a summary reply's messages.
+func (res compactResult) summary() string {
+	var b strings.Builder
+	for _, o := range res.Output {
+		if o.Type != "message" {
+			continue
+		}
+		for _, c := range o.Content {
+			b.WriteString(c.Text)
+		}
+	}
+	return b.String()
+}
+
+// calledTool is whether a summary reply called a tool: a function_call,
+// custom_tool_call, tool_search_call, a hosted tool's call.
+func calledTool(out []compactOutput) bool {
+	return slices.ContainsFunc(out, func(o compactOutput) bool { return strings.HasSuffix(o.Type, "_call") })
 }
 
 // answeredWith says what a summary reply without a summary held instead
